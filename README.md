@@ -17,6 +17,7 @@
 13. [Web Dashboard](#13-web-dashboard)
 14. [Security Architecture](#14-security-architecture)
 15. [Failover & Sync](#15-failover--sync)
+16. [Technology Deep Dive](#16-technology-deep-dive)
 
 ---
 
@@ -728,4 +729,620 @@ Per-guild module toggles: game, nameplate, AI
 
 ---
 
-*From project analysis -- 90+ files, ~32,000 lines of code*
+---
+
+## 16. Technology Deep Dive
+
+### 16.1 AI Orchestration Engine (`groqChat.js` -- 1685 lines)
+
+The central AI system that processes every user message through a multi-stage pipeline.
+
+**Core Loop:**
+```
+User Message -> Dedup Check -> Guild Approval -> Message Classification
+    -> Context Building -> LLM Chain Call -> Response Parsing -> Reply
+    -> Background Memory Extraction (async)
+```
+
+**Message Classification (`classifyComplexity`):**
+Returns complexity tier 0-4 based on keyword analysis:
+- **Tier 0**: Greetings, short banter (< 25 chars, matches greeting regex)
+- **Tier 1**: Standard questions, general chat (default)
+- **Tier 2**: Coding keywords, > 300 chars, multi-step questions
+- **Tier 3**: Deep keywords (architecture, math, refactoring), > 800 chars
+- **Tier 4**: Extreme keywords (agent, debate, audit), > 2500 chars
+
+**Advanced Intent Analysis (`analyzeMessageIntent`):**
+Single-pass LLM classification that outputs JSON with:
+- `category`: coding | math | creative | roleplay | general
+- `emotion`: happy | angry | sad | confused | joking | serious
+- `routing_mode`: FAST | DEEP | MEMORY | TOOL | DEBATE | SEARCH
+- `context_budget`: Dynamic token budgets for history, memory, profile
+- `confidence`: 0-1 confidence score
+
+**Context Building (`buildOptimizedContext`):**
+Assembles prompt context within token budgets:
+- Profile summary (IGN, sect, weapons, inner ways) -- 200 token budget
+- Personality block (communication style, tone, relationship tier)
+- User memory facts ranked by relevance (500 token budget)
+- Server memory facts ranked by relevance
+- Channel summary for conversation continuity
+- RPG game stats if player exists
+
+**Memory Ranking Algorithm (`rankFacts`):**
+Hybrid semantic ranking with exponential time decay:
+```
+score = (keywordScore * 0.4) + (semanticScore * 0.6) + (importance * 0.2 * decay) + recencyBoost
+```
+- **Keyword score**: +10 per exact word match
+- **Semantic score**: +10 per synonym match (via CONCEPT_MAP), or bigram similarity * 10 if > 0.6
+- **Time decay**: `exp(-ageDays * decayRate)` where rate varies by type:
+  - identity: 0 (never decays)
+  - preference: 0.005
+  - skill: 0.01
+  - temporary: 0.1
+- **Correction boost**: Facts starting with "Correction:" get +100 score
+
+**Bigram Similarity (`bigramSimilarity`):**
+Character-level Jaccard similarity using 2-gram sets:
+```
+similarity = |bigrams(a) INTERSECTION bigrams(b)| / |bigrams(a) UNION bigrams(b)|
+```
+
+**Synonym Detection (`areSynonyms`):**
+Concept maps group related terms (e.g., {fps, shooter, shooting}, {coding, developer, code}).
+
+**Response Parsing (`parseBrainResponse`):**
+Extracts structured data from LLM XML output:
+- `<action>`: TEXT_ONLY | TEXT_AND_IMAGE | IMAGE_ONLY
+- `<image_prompt>`: Image generation prompt
+- `<memory_update>`: Memory commands (ADD/UPDATE/DELETE)
+- `<reply>`: Actual response text
+
+**Token Budget Enforcement (`enforceTokenBudget`):**
+Trims oldest messages from history until total estimated tokens fit within limit. Uses `estimateTokens()` which approximates at 4 chars/token.
+
+**Memory Update Debounce:**
+Per-user 3-minute cooldown between memory extraction runs. Stale map entries auto-pruned every 30 minutes.
+
+---
+
+### 16.2 Model Router & Cascade (`modelRouter.js` -- 652 lines)
+
+Intelligent model selection and API key rotation system.
+
+**8-Model Chain:**
+```
+llama-3.1-8b-instant -> qwen/qwen3-32b -> llama-3.3-70b-versatile
+    -> openai/gpt-oss-120b -> openai/gpt-oss-20b
+    -> groq/compound-mini -> groq/compound -> allam-2-7b
+```
+
+**Per-Model Rate Limits (hardcoded):**
+| Model | TPM | RPD | RPM |
+|-------|-----|-----|-----|
+| llama-3.1-8b-instant | 6,000 | 14,400 | 30 |
+| qwen/qwen3-32b | 6,000 | 1,000 | 60 |
+| llama-3.3-70b-versatile | 12,000 | 1,000 | 30 |
+| groq/compound-mini | 70,000 | 250 | 30 |
+| meta-llama/llama-4-scout | 30,000 | 1,000 | 30 |
+
+**Smart Model Selection (`selectAndSortModels`):**
+Sorts models by composite score:
+1. TPM fits required tokens (priority)
+2. Not near 80% TPM limit (priority)
+3. Performance score from feedback loop (descending)
+4. Original chain position (ascending)
+5. RPD remaining (descending)
+
+**Per-Minute Token Tracking (`modelTokenUsage` Map):**
+- Sliding 60-second window per model
+- Auto-reset when window expires
+- Reports usage percentage vs TPM limit
+- 80% threshold marks model as "near limit"
+
+**Key Pool Management (`getAPIKeysPool`):**
+Assembles key pool from 3 sources (deduplicated by value):
+1. Guild-specific key (from guild config, highest priority)
+2. Community-contributed keys (from `contributed_keys` table)
+3. Default system key (`GROQ_API_KEY` env var)
+
+**Key Selection Scoring (`selectBestKey`):**
+```
+score = (rateLimited * 1000) + (failures * 10) + (lastUsed / 1000000)
+```
+Lowest score wins. Rate-limited keys get huge penalty. Recently used keys get slight penalty for rotation.
+
+**Rate Limit Handling:**
+- Parses `x-ratelimit-reset-tokens` header (e.g., "1m30s", "250ms")
+- Marks key rate-limited for reset time + 5s buffer (max 65s)
+- 401 Unauthorized: Auto-disables contributed key permanently
+- TCP errors: Key NOT penalized (network issue, not key issue)
+- 429 rate limit: Waits reset time, then tries next key
+
+**Semaphore (`requestSemaphore`):**
+Max 5 concurrent API requests. Queue max 100. Rejects with error when full.
+
+**Chain Execution (`callGroqAPIWithChain`):**
+For each model in sorted order:
+  For each key in pool (excluding already-tried):
+    Try request -> success: return | failure: mark key, try next
+  If all keys exhausted for this model: try next model
+Last resort: Try near-limit models if all healthy models exhausted
+
+**Token Usage Correction:**
+After response, if Groq returns actual `usage.total_tokens`, corrects the estimated count. Also checks `x-ratelimit-remaining-tokens` header to sync with Groq's server-side tracking.
+
+**Prompt Cache Detection:**
+Logs `cache_read_input_tokens` from Groq response (50% discount applied by Groq for cached prompts).
+
+---
+
+### 16.3 Message Classification System (`messageClassifier.js` -- 356 lines)
+
+Multi-tier classification for routing messages to appropriate models.
+
+**Capacity Calculation (`calculateCapacity`):**
+Determines max intelligence tier based on available resources:
+- 4+ unique key accounts AND 4+ healthy models -> tier 4
+- 3+ accounts AND 3+ models -> tier 3
+- 2+ accounts AND 2+ models -> tier 2
+- Otherwise -> tier 1
+
+**Intelligence Tier Resolution (`determineIntelligenceTier`):**
+```
+tier = min(complexity, maxAllowedTier)
+tier = max(1, tier)  // minimum tier 1
+```
+Exception: Tier 0 (greetings) always stays tier 0.
+
+**Racing Disable (`shouldDisableRacing`):**
+Disables multi-model racing when primary or smart model usage exceeds 50% daily.
+
+**LLM-Powered Intent Analysis:**
+Full prompt analysis using `llama-3.1-8b-instant` with `temperature: 0` and `response_format: json_object` for deterministic classification output.
+
+---
+
+### 16.4 Critic Passes & Multi-Model Debate (`criticPasses.js`)
+
+Optional multi-model pipeline for complex queries:
+- **Architect Model**: Generates initial response
+- **Critic Model**: Reviews and critiques the response
+- **Judge/Critic Model**: Arbitrates between architect and critic
+- **Finalizer**: Produces final polished output
+- **Alternative Thinker**: Provides different perspective
+- **Speed Runner**: Quick low-resource response
+
+Models are selected from the chain based on availability and health.
+
+---
+
+### 16.5 Resource Manager (`resourceManager.js` -- 418 lines)
+
+Event-driven system monitoring with adaptive response.
+
+**Sampling:**
+- CPU: 1-second interval using `process.cpuUsage()` delta
+- RAM: 2-second interval using `process.memoryUsage()`
+- Normalized to 0-100% across all cores
+
+**Zone Determination:**
+```
+emergency: cpu >= 90% OR rss >= 95% OR heap >= 95%
+high:      cpu >= 80% OR rss >= 80% OR heap >= 80%
+busy:      cpu >= 70% OR rss >= 70% OR heap >= 70%
+normal:    everything below
+```
+
+**Hysteresis (Debounce):**
+Zone changes debounced to 3-second minimum interval to prevent rapid bouncing (e.g., high -> busy -> high).
+
+**Adaptive Queue Delay:**
+```
+normal: base delay (10ms)
+busy:   max(5ms, base * 2)
+high:   max(10ms, base * 4)
+emergency: max(20ms, base * 8)
+```
+
+**Adaptive Worker Count:**
+Dynamically adjusts worker threads based on zone:
+- normal: minWorkers
+- busy: minWorkers + 1
+- high: minWorkers + 2
+- emergency: maxWorkers
+
+**Event Emissions:**
+- `zoneChange(newZone, oldZone)` -- Triggers cache clearing, scheduler throttling
+- `emergencyChange(isEmergency)` -- Emergency protocol activation
+- `tickEmergency` -- 5-second interval during emergency state
+
+---
+
+### 16.6 Encryption System (`crypto.js` -- 144 lines)
+
+AES-256-GCM authenticated encryption for data at rest.
+
+**Two Independent Keys:**
+1. `ENCRYPTION_SECRET` -- For API key encryption (64-char hex = 32 bytes)
+2. `SYNC_ENCRYPTION_KEY` -- For sync payload encryption (64-char hex = 32 bytes)
+
+**String Encryption (`encryptApiKey`):**
+```
+Storage format: <iv_hex>:<authTag_hex>:<ciphertext_hex>
+IV: 12 bytes (96-bit, recommended for GCM)
+Auth Tag: 16 bytes (128-bit)
+Algorithm: AES-256-GCM
+```
+
+**Buffer Encryption (`encryptBuffer`):**
+Binary format: `[IV(12)][AuthTag(16)][Ciphertext]` -- prepended to buffer.
+
+**Legacy Handling:**
+- `PLAIN:` prefix: Transparent plaintext passthrough
+- No colons: Assumed raw plaintext from pre-encryption era
+- Graceful degradation: Logs warning but doesn't crash if key missing
+
+---
+
+### 16.7 Database Caching Layer (`db.js` -- 899 lines)
+
+Multi-tier caching with LRU eviction and memory pressure response.
+
+**Cache Configuration:**
+```javascript
+_profileCache: LRUCache({ max: 500, ttl: 10 * 60 * 1000 })  // 500 entries, 10 min
+_guildCache:   LRUCache({ max: 500, ttl: 10 * 60 * 1000 })  // 500 entries, 10 min
+_welcomeDmCache: Map({ max: 10000, ttl: 24 * 60 * 60 * 1000 }) // 24h
+```
+
+**Memory Pressure Handler (`_onMemoryPressure`):**
+Triggered by Resource Manager on `high` or `emergency` zone:
+1. Clears `_profileCache` entirely
+2. Clears `_guildCache` entirely
+3. Trims `_welcomeDmCache` to half max
+4. Logs RSS freed
+
+**Deep Clone Safety:**
+All cache reads return `JSON.parse(JSON.stringify(obj))` clones to prevent external mutation.
+
+**Welcome DM Cache:**
+Hourly cleanup of expired entries (24h TTL). Max 10,000 entries enforced by LRU-style eviction.
+
+---
+
+### 16.8 Turso Embedded Replica System (`turso.js` -- 151 lines)
+
+Cloud-synced SQLite with local fallback.
+
+**Architecture:**
+```
+Local SQLite (WAL mode) <-> libsql Embedded Replica <-> Turso Cloud
+```
+
+**Monthly Write Limit:**
+Tracks writes via `system_stats` table. Hard cap at 9,999,000 (safety buffer below 10M limit). When reached, sync suspended.
+
+**Cached Reads:**
+```javascript
+tursoReadCache: LRUCache({ max: 500, ttl: 5 * 60 * 1000 })
+```
+Invalidated by pattern matching on SQL queries.
+
+**Database Modes:**
+- `turso`: Normal embedded replica with cloud sync (default)
+- `local`: Local SQLite only, no cloud sync
+- `standalone_turso`: Direct Turso cloud without local SQLite
+
+**Sync Handling:**
+libsql native sync handles replication automatically. Manual sync function is a no-op (legacy compatibility).
+
+---
+
+### 16.9 Combat System (`combat.js` -- 909 lines)
+
+Turn-based RPG combat with stat calculations and dual-weapon swapping.
+
+**Player Stat Formulas:**
+```
+maxHp      = body * 15 + defense * 5 + sum(equipment.stat_hp) + sum(tuning.hp)
+maxAtk     = power * 3.5 + sum(equipment.stat_atk_max) + sum(tuning.atk)
+minAtk     = maxAtk * (0.4 + agility / 200)
+defMit     = defense * 1.2 + sum(equipment.stat_def) + sum(tuning.def)
+critRate   = min(80, agility / 5) + sum(tuning.crit)
+affRate    = min(50, momentum / 8) + sum(tuning.aff)
+critDamage = 1.35 (35% base)
+```
+
+**Sect Passive Modifiers:**
+Applied as multiplicative buffs (e.g., `damageMult`, `defenseMult`, `critRateBonus`, `lifesteal`, `healBoost`, `startingShield`).
+
+**Enemy Scaling:**
+```
+scale = 1 + (level - 1) * 0.15
+hp    = floor(BASE_HP * scale * eliteMultiplier)
+atk   = floor(BASE_ATK * scale * eliteMultiplier)
+def   = floor(BASE_DEF * scale * eliteMultiplier)
+```
+Elite multiplier: HP x2.5, ATK x1.5, DEF x1.3
+
+**Turn Resolution (`executeCombatTurnCalc`):**
+
+Player attack type selection:
+```
+60% chance: Check crit -> if crit: critDamage multiplier
+            else: Precision Hit (normal)
+40% chance: Check affinity -> if aff: 1.20x multiplier
+            else: Normal Hit
+```
+
+Action multipliers:
+- Martial: 1.5x
+- Special: 1.2x (+ 25% crit chance)
+- Charged: 2.0x (- 20% defense)
+- Block: 0.5x (+ 50% counter damage, - 50% incoming)
+- Mystic Skills: Fixed damage formulas (e.g., Tai Chi: `80 + rank*15 + tier*50`)
+
+**Weapon Passives:**
+- Sword: 25% chance + 20% bonus damage (Relentless Chase)
+- Spear: 30% chance + 30% bonus damage (Guard Break)
+- Fan: + 5% maxHp healing per turn
+- Umbrella: + 25 shield per turn
+- Twin Blades: + 0.2 crit damage multiplier on crits
+- Rope Dart: 20% chance + 40% bonus damage (Thread Combo)
+
+**Dual-Weapon Swap:**
+Every 3rd phase, automatically swaps between primary and secondary weapon.
+
+**Mystic Skills (6 skills):**
+- **Tai Chi** (35v): `80 + rank*15 + tier*50` damage, heal 10% maxHp
+- **Meridian Touch** (45v): Base damage, stun enemy, -defense debuff
+- **Celestial Seize** (40v): 1.2x base damage, steal enemy attack
+- **Golden Body** (50v): Shield + 50% defense boost for 2 turns
+- **Cloud Steps**: Evasion skill
+- **Glow of Fireflies**: Damage over time
+
+---
+
+### 16.10 Loot Generation (`loot.js` -- 251 lines)
+
+Probabilistic item generation with rarity tiers and stat rolling.
+
+**Rarity Weights:**
+| Rarity | Drop Chance | Stat Multiplier | Tuning Slots |
+|--------|-------------|-----------------|--------------|
+| Common | 25% | 0.8x | 1 |
+| Uncommon | 30% | 1.0x | 2 |
+| Rare | 25% | 1.25x | 3 |
+| Epic | 12% | 1.5x | 4 |
+| Legendary | 5% | 1.9x | 5 |
+| Mythic | 2% | 2.4x | 5 |
+| Divine | 1% | 3.0x | 5 |
+
+**Stat Generation:**
+```
+finalStat = floor(baseStat * rarityMultiplier * (1 + level * 0.1))
+```
+
+**Item Type Distribution:**
+- 35% weapon (random type from 6)
+- 40% armor (random slot: head/chest/arms/legs)
+- 25% accessory (random slot: pendant/disc/ring)
+
+**Dismantle Rewards:**
+| Rarity | Gold |
+|--------|------|
+| Common | 50 |
+| Uncommon | 100 |
+| Rare | 250 |
+| Epic | 600 |
+| Legendary | 1,500 |
+| Mythic | 3,500 |
+| Divine | 10,000 |
+
+---
+
+### 16.11 Raid Engine (`raidEngine.js` -- 505 lines)
+
+Multiplayer boss encounters with scaling and threat management.
+
+**Boss Encounters:**
+| Boss | HP | ATK | DEF | Mechanics |
+|------|-----|-----|-----|-----------|
+| Dalang (Demon Steed) | 1,800 | 36 | 8 | Mobile, leaped stomps, Evade to dodge |
+| Wandering Swordsman | 1,500 | 45 | 12 | Precision parrier, Parry to stagger |
+| Corrupted General | 2,600 | 32 | 22 | Armor behemoth, Shield to mitigate |
+
+**Level Scaling:**
+```
+scaledLevel = getScaledBossLevel(playerLevel)  // brackets: 5, 15, 25, 40, 60
+scaleMult   = sqrt(scaledLevel)
+bossMaxHp   = floor(baseHp * scaleMult * teamMultiplier)
+bossAtk     = floor(baseAtk * (1 + scaledLevel * 0.08))
+```
+
+**Team Size Multiplier:**
+- 5-player lobby: 1.0x boss HP
+- 10-player lobby: 1.8x boss HP
+
+**Threat System:**
+Each player accumulates threat from damage dealt. Boss targets highest threat player. Tanking mechanics reduce incoming damage.
+
+**In-Memory State:**
+Raids stored in `activeRaids` Map with automatic cleanup:
+- Victory/defeat states: cleaned after 60 minutes
+- Lobby state: cleaned after 60 minutes of inactivity
+- Cleanup runs every 10 minutes via Resource Manager scheduler
+
+---
+
+### 16.12 Story Engine (`storyEngine.js` -- 955 lines)
+
+LLM-driven dynamic narrative with pre-generated branches.
+
+**Jaro-Winkler Similarity:**
+Used for fuzzy matching player text input to story choices:
+```
+matchWindow = floor(max(len1, len2) / 2) - 1
+Jaro = (matches/len1 + matches/len2 + (matches-transpositions)/matches) / 3
+JaroWinkler = Jaro + l * p * (1 - Jaro)  // p = 0.1, l = common prefix length (max 4)
+```
+
+**Story Generation Flow:**
+1. Player selects root story node (predefined)
+2. LLM generates 2-3 choices for each node
+3. Choices are pre-generated in background (Jaro-Winkler matching)
+4. Player text input matched to closest choice via similarity
+5. Cloudflare AI generates image for each story node
+
+**Image Generation:**
+Uses Cloudflare Workers AI (`@cf/stabilityai/stable-diffusion-xl-base-1.0`) with Pollinations.ai fallback.
+
+---
+
+### 16.13 Background Thinking System (`backgroundThinking.js` -- 363 lines)
+
+Async post-conversation analysis and memory consolidation.
+
+**Trigger:**
+Queue-based: Runs every 30 seconds, processes channels quiet for 2+ minutes.
+
+**Analysis Prompt (4 outputs):**
+1. **Feedback/Sentiment**: positive | negative | neutral + explanation
+2. **Personality Patch**: tone, depth, nickname, topics, knowledge, avoidances, relationship metrics
+3. **Memory Updates**: ADD/UPDATE/DELETE commands for user/server facts
+4. **Channel Summary**: Consolidated conversation summary (< 200 chars)
+
+**JSON Repair (`repairTruncatedJSON`):**
+Handles truncated LLM output by:
+1. Closing unclosed strings
+2. Removing trailing commas
+3. Closing unclosed braces/brackets via stack tracking
+
+**Model Score Feedback Loop:**
+- Positive sentiment: +0.05 score delta per model used
+- Negative sentiment: -0.10 score delta per model used
+- Scores influence model selection in `selectAndSortModels`
+
+**Memory Update Commands:**
+```
+ADD_USER_FACT: <fact>
+UPDATE_USER_FACT: <idx> | <new_fact>
+DELETE_USER_FACT: <idx>
+ADD_SERVER_FACT: <fact>
+UPDATE_SERVER_FACT: <idx> | <new_fact>
+DELETE_SERVER_FACT: <idx>
+```
+
+**Correction Learning:**
+Detects user corrections in history (e.g., "no that's wrong") and stores failure reasons as "Correction:" facts with +100 priority boost.
+
+---
+
+### 16.14 Profile Card System (`nameplate.js` -- 315 lines)
+
+Discord embed-based profile cards with tier color coding.
+
+**Tier Color Mapping:**
+| Inner Way Tier | Color | Hex |
+|----------------|-------|-----|
+| T6 | Crimson | 0xe74c3c |
+| T5 | Orange | 0xe67e22 |
+| T4 | Gold | 0xf1c40f |
+| T3 | Purple | 0x9b59b6 |
+| T2 | Blue | 0x3498db |
+| T1 | Green | 0x2ecc71 |
+| T0 | Grey | 0x95a5a6 |
+
+**Nameplate Components:**
+- Header (sect/guild, registration status)
+- Player info (Discord mention, IGN)
+- Bio/personal quote (smart-truncated at word boundaries)
+- Equipped loadout (primary/secondary weapons)
+- 4 Inner Way slots with tier/type indicators
+- Relationship status (partners/disciples)
+- Leave/vacation status
+
+**SVG-to-PNG Pipeline:**
+Worker thread pool (`imageWorkerPool.js`) processes SVG templates via `sharp` for image-based cards.
+
+---
+
+### 16.15 State Machine (`stateManager.js` -- 592 lines)
+
+Player game state management with Discord UI rendering.
+
+**States:**
+```
+town -> explore_select -> combat
+town -> shop -> town
+town -> training -> town
+town -> develop -> skills/breakthrough
+town -> campaign -> story
+town -> raid_select -> raid_lobby -> raid_combat
+```
+
+**UI Rendering:**
+Each state renders Discord embeds with:
+- Thumbnail images (pre-generated PNGs from `generated_art/`)
+- Interactive button rows for navigation
+- Status fields (HP, gold, realm, level)
+
+**Action Lock System (`gameStateLock.js`):**
+Per-user mutex preventing concurrent game actions. Uses `acquireActionLock`/`releaseActionLock` pattern.
+
+---
+
+### 16.16 WebSocket & Live Updates
+
+**Dashboard Communication:**
+- WebSocket server in Express for real-time PM2 log streaming
+- `botBridge.js` sends commands from dashboard to bot process
+- `eventBus.js` internal pub/sub for cross-process events
+
+**Live Console:**
+WebSocket streams PM2 logs to dashboard admin panel in real-time.
+
+---
+
+### 16.17 Image Processing Pipeline
+
+**Worker Pool (`imageWorkerPool.js`):**
+- Configurable min/max workers (1-4)
+- SVG-to-PNG conversion via `sharp`
+- Pre-generated thumbnails for game locations
+- Story node image generation via Cloudflare AI
+
+**Generated Art Assets:**
+Pre-rendered PNG thumbnails in `src/game/generated_art/`:
+- Town square, shop, world map
+- Region thumbnails (Qinghe Forest, Kaifeng Outskirts)
+- Enemy portraits
+
+---
+
+### 16.18 Maintenance Scheduler (`maintenance.js` -- 209 lines)
+
+Daily automated tasks:
+- API key validation (test each contributed key)
+- Vacation check-in processing
+- Active member thread synchronization
+- Turso database backup
+- Stale cache cleanup
+- Memory consolidation ("bot dreams")
+
+---
+
+### 16.19 Bot Dreams (`botDreams.js` -- 222 lines)
+
+Nightly memory consolidation system:
+- Deduplicates similar memory facts
+- Merges related facts
+- Prunes low-importance, unused facts
+- Consolidates personality data
+- Runs during low-traffic hours
+
+---
+
+*Generated from project analysis -- 90+ files, ~32,000 lines of code*
