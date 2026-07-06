@@ -1345,4 +1345,4 @@ Nightly memory consolidation system:
 
 ---
 
-*Generated from project analysis -- 90+ files, ~32,000 lines of code*
+*From project analysis -- 90+ files, ~32,000 lines of code*
